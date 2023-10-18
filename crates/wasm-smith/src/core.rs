@@ -172,6 +172,11 @@ impl Module {
         Ok(module)
     }
 
+    /// Returns globals
+    pub fn globals(&self) -> Vec<GlobalType> {
+        self.globals.clone()
+    }
+
     fn empty(config: Rc<dyn Config>, duplicate_imports_behavior: DuplicateImportsBehavior) -> Self {
         Module {
             config,

@@ -172,11 +172,6 @@ impl Module {
         Ok(module)
     }
 
-    /// Returns globals
-    pub fn globals(&self) -> Vec<GlobalType> {
-        self.globals.clone()
-    }
-
     fn empty(config: Rc<dyn Config>, duplicate_imports_behavior: DuplicateImportsBehavior) -> Self {
         Module {
             config,
@@ -345,8 +340,8 @@ pub(crate) enum Offset {
     Global(u32),
 }
 
-#[derive(Debug)]
-pub(crate) enum GlobalInitExpr {
+#[derive(Debug, Clone)]
+pub enum GlobalInitExpr {
     FuncRef(u32),
     ConstExpr(ConstExpr),
 }
@@ -422,9 +417,7 @@ impl Module {
     }
 
     fn can_add_local_or_import_tag(&self) -> bool {
-        self.config.exceptions_enabled()
-            && self.has_tag_func_types()
-            && self.tags.len() < self.config.max_tags()
+        false
     }
 
     fn can_add_local_or_import_func(&self) -> bool {
@@ -436,7 +429,7 @@ impl Module {
     }
 
     fn can_add_local_or_import_global(&self) -> bool {
-        self.globals.len() < self.config.max_globals()
+        false
     }
 
     fn can_add_local_or_import_memory(&self) -> bool {
@@ -1339,6 +1332,22 @@ impl Module {
                 (ty.params.to_vec(), ty.results.to_vec())
             }
         }
+    }
+
+    /// Returns exproted globals
+    /// We disable importing globals by setting can_add_local_or_import_global to false
+    pub fn globals(&self) -> Vec<(GlobalType, GlobalInitExpr)> {
+        self.globals
+            .clone()
+            .iter()
+            .enumerate()
+            .map(|(i, g)| (*g, self.defined_globals[i].clone().1))
+            .collect()
+    }
+
+    /// Returns exports
+    pub fn exports(&self) -> Vec<(String, ExportKind, u32)> {
+        self.exports.clone()
     }
 }
 

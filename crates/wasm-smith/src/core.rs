@@ -8,6 +8,7 @@ use crate::{arbitrary_loop, limited_string, unique_string, Config, DefaultConfig
 use arbitrary::{Arbitrary, Result, Unstructured};
 use code_builder::CodeBuilderAllocations;
 use flagset::{flags, FlagSet};
+use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::marker;
@@ -1334,10 +1335,36 @@ impl Module {
         }
     }
 
-    /// Returns exproted globals
+    /// Returns exproted globals and instrumentation fix
     /// We disable importing globals by setting can_add_local_or_import_global to false
     pub fn exported_globals(&self) -> Vec<(GlobalType, &wasm_encoder::ConstExpr)> {
-        self.globals
+        let mut visited: BTreeSet<usize> = BTreeSet::new();
+        let mut exported_globals: Vec<(GlobalType, &wasm_encoder::ConstExpr)> = self
+            .exports
+            .iter()
+            .filter_map(|export| {
+                if export.1 == ExportKind::Global {
+                    let defined_global = self
+                        .defined_globals
+                        .iter()
+                        .find(|defined_global| defined_global.0 == export.2);
+                    if let Some(global) = defined_global {
+                        let expr = match &global.1 {
+                            GlobalInitExpr::FuncRef(_) => return None,
+                            GlobalInitExpr::ConstExpr(expr) => expr,
+                        };
+                        visited.insert(export.2 as usize);
+                        return Some((self.globals[export.2 as usize], expr));
+                    }
+                    None
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mutable_globals: Vec<(GlobalType, &wasm_encoder::ConstExpr)> = self
+            .globals
             .clone()
             .iter()
             .enumerate()
@@ -1346,6 +1373,10 @@ impl Module {
                     .defined_globals
                     .iter()
                     .find(|defined_global| defined_global.0 as usize == i);
+
+                if visited.contains(&i) || !g.mutable {
+                    return None;
+                }
 
                 if let Some(global) = defined_global {
                     let expr = match &global.1 {
@@ -1356,7 +1387,10 @@ impl Module {
                 }
                 None
             })
-            .collect()
+            .collect();
+
+        exported_globals.extend_from_slice(&mutable_globals);
+        exported_globals
     }
 
     /// Returns exports
@@ -1364,7 +1398,7 @@ impl Module {
         self.exports.clone()
     }
 
-    /// Return globals
+    /// Returns globals
     pub fn globals(&self) -> Vec<GlobalType> {
         self.globals.clone()
     }

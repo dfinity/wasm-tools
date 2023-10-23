@@ -340,8 +340,8 @@ pub(crate) enum Offset {
     Global(u32),
 }
 
-#[derive(Debug, Clone)]
-pub enum GlobalInitExpr {
+#[derive(Debug)]
+pub(crate) enum GlobalInitExpr {
     FuncRef(u32),
     ConstExpr(ConstExpr),
 }
@@ -1336,18 +1336,38 @@ impl Module {
 
     /// Returns exproted globals
     /// We disable importing globals by setting can_add_local_or_import_global to false
-    pub fn globals(&self) -> Vec<(GlobalType, GlobalInitExpr)> {
-        self.globals
-            .clone()
+    pub fn exported_globals(&self) -> Vec<(GlobalType, &wasm_encoder::ConstExpr)> {
+        self.exports
             .iter()
-            .enumerate()
-            .map(|(i, g)| (*g, self.defined_globals[i].clone().1))
+            .filter_map(|export| {
+                if export.1 == ExportKind::Global {
+                    let defined_global = self
+                        .defined_globals
+                        .iter()
+                        .find(|defined_global| defined_global.0 == export.2);
+                    if let Some(global) = defined_global {
+                        let expr = match &global.1 {
+                            GlobalInitExpr::FuncRef(_) => return None,
+                            GlobalInitExpr::ConstExpr(expr) => expr,
+                        };
+                        return Some((self.globals[export.2 as usize], expr));
+                    }
+                    None
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 
     /// Returns exports
     pub fn exports(&self) -> Vec<(String, ExportKind, u32)> {
         self.exports.clone()
+    }
+
+    /// Return globals
+    pub fn globals(&self) -> Vec<GlobalType> {
+        self.globals.clone()
     }
 }
 

@@ -2810,7 +2810,7 @@ impl Encode for Instruction<'_> {
 /// A constant expression.
 ///
 /// Usable in contexts such as offsets or initializers.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ConstExpr {
     bytes: Vec<u8>,
 }

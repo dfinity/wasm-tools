@@ -1337,25 +1337,24 @@ impl Module {
     /// Returns exproted globals
     /// We disable importing globals by setting can_add_local_or_import_global to false
     pub fn exported_globals(&self) -> Vec<(GlobalType, &wasm_encoder::ConstExpr)> {
-        self.exports
+        self.globals
+            .clone()
             .iter()
-            .filter_map(|export| {
-                if export.1 == ExportKind::Global {
-                    let defined_global = self
-                        .defined_globals
-                        .iter()
-                        .find(|defined_global| defined_global.0 == export.2);
-                    if let Some(global) = defined_global {
-                        let expr = match &global.1 {
-                            GlobalInitExpr::FuncRef(_) => return None,
-                            GlobalInitExpr::ConstExpr(expr) => expr,
-                        };
-                        return Some((self.globals[export.2 as usize], expr));
-                    }
-                    None
-                } else {
-                    None
+            .enumerate()
+            .filter_map(|(i, g)| {
+                let defined_global = self
+                    .defined_globals
+                    .iter()
+                    .find(|defined_global| defined_global.0 as usize == i);
+
+                if let Some(global) = defined_global {
+                    let expr = match &global.1 {
+                        GlobalInitExpr::FuncRef(_) => return None,
+                        GlobalInitExpr::ConstExpr(expr) => expr,
+                    };
+                    return Some((*g, expr));
                 }
+                None
             })
             .collect()
     }

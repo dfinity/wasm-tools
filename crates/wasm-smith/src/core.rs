@@ -8,6 +8,7 @@ use crate::{arbitrary_loop, limited_string, unique_string, Config, DefaultConfig
 use arbitrary::{Arbitrary, Result, Unstructured};
 use code_builder::CodeBuilderAllocations;
 use flagset::{flags, FlagSet};
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::convert::TryFrom;
@@ -200,6 +201,7 @@ impl Module {
             code: Vec::new(),
             data: Vec::new(),
             type_size: 0,
+            // Reserved names should go here
             export_names: HashSet::new(),
         }
     }
@@ -245,7 +247,7 @@ pub(crate) enum Type {
 
 /// A function signature.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct FuncType {
+pub struct FuncType {
     /// Types of the parameter values.
     pub(crate) params: Vec<ValType>,
     /// Types of the result values.
@@ -385,6 +387,15 @@ impl Module {
         // for the available imports before generating arbitrary types here.
         let min = self.config.min_types().saturating_sub(self.types.len());
         let max = self.config.max_types().saturating_sub(self.types.len());
+
+        // Record a () -> () type for canister exports
+        let ty = Type::Func(Rc::new(FuncType {
+            params: vec![],
+            results: vec![],
+        }));
+        self.record_type(&ty);
+        self.types.push(ty);
+
         arbitrary_loop(u, min, max, |u| {
             let ty = self.arbitrary_type(u)?;
             self.record_type(&ty);
@@ -938,13 +949,42 @@ impl Module {
                 .map(|i| (ExportKind::Global, i as u32))
                 .collect(),
         );
+        let mut canister_functions_unit_type: Vec<&str> = vec![
+            "canister_init",
+            "canister_inspect_message",
+            "canister_pre_upgrade",
+            "canister_post_upgrade",
+            "canister_heartbeat",
+            "canister_global_timer",
+        ];
 
         // If the configuration demands exporting everything, we do so here and
         // early-return.
         if self.config.export_everything() {
             for choices_by_kind in choices {
                 for (kind, idx) in choices_by_kind {
-                    let name = unique_string(1_000, &mut self.export_names, u)?;
+                    let name;
+                    if kind == ExportKind::Func && self.funcs[idx as usize].0 == 0 {
+                        // IC function export logic
+                        if canister_functions_unit_type.len() > 0 {
+                            let choice = u.choose_index(canister_functions_unit_type.len())?;
+                            name = canister_functions_unit_type[choice].to_string();
+                            canister_functions_unit_type.remove(choice);
+                        } else {
+                            let suffix = unique_string(1_000, &mut self.export_names, u)?;
+                            if u.ratio(1, 3)? {
+                                name = format!("canister_update_{}", suffix);
+                            } else {
+                                if u.ratio(1, 2)? {
+                                    name = format!("canister_query_{}", suffix);
+                                } else {
+                                    name = format!("canister_composite_query_{}", suffix);
+                                }
+                            }
+                        }
+                    } else {
+                        name = unique_string(1_000, &mut self.export_names, u)?;
+                    }
                     self.add_arbitrary_export(name, kind, idx)?;
                 }
             }
@@ -1401,6 +1441,11 @@ impl Module {
     /// Returns globals
     pub fn globals(&self) -> Vec<GlobalType> {
         self.globals.clone()
+    }
+
+    /// Returns functions
+    pub fn functions(&self) -> Vec<(u32, Rc<FuncType>)> {
+        self.funcs.clone()
     }
 }
 

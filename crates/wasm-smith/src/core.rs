@@ -978,12 +978,12 @@ impl Module {
                         } else {
                             let suffix = unique_string(1_000, &mut self.export_names, u)?;
                             if u.ratio(1, 3)? {
-                                name = format!("canister_update_{}", suffix);
+                                name = format!("canister_update {}", suffix);
                             } else {
                                 if u.ratio(1, 2)? {
-                                    name = format!("canister_query_{}", suffix);
+                                    name = format!("canister_query {}", suffix);
                                 } else {
-                                    name = format!("canister_composite_query_{}", suffix);
+                                    name = format!("canister_composite_query {}", suffix);
                                 }
                             }
                         }

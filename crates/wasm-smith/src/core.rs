@@ -8,7 +8,6 @@ use crate::{arbitrary_loop, limited_string, unique_string, Config, DefaultConfig
 use arbitrary::{Arbitrary, Result, Unstructured};
 use code_builder::CodeBuilderAllocations;
 use flagset::{flags, FlagSet};
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::convert::TryFrom;
@@ -201,8 +200,14 @@ impl Module {
             code: Vec::new(),
             data: Vec::new(),
             type_size: 0,
-            // Reserved names should go here
-            export_names: HashSet::new(),
+            export_names: HashSet::from([
+                "canister counter_instructions".to_string(),
+                "canister_start".to_string(),
+                "canister counter_dirty_pages".to_string(),
+                "canister counter_accessed_page".to_string(),
+                "stable_memory".to_string(),
+                "stable_bytemap_memory".to_string(),
+            ]),
         }
     }
 }

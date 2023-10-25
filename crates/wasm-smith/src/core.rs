@@ -1450,6 +1450,15 @@ impl Module {
     pub fn exports(&self) -> Vec<(String, ExportKind, u32)> {
         self.exports.clone()
     }
+
+    /// Returns true if export length < 20_000
+    pub fn is_total_export_length_valid(&self) -> bool {
+        self.exports
+            .iter()
+            .map(|(name, _, _)| name.len())
+            .sum::<usize>()
+            < 20_000
+    }
 }
 
 pub(crate) fn arbitrary_limits32(

@@ -969,7 +969,11 @@ impl Module {
             for choices_by_kind in choices {
                 for (kind, idx) in choices_by_kind {
                     let name;
-                    if kind == ExportKind::Func && self.funcs[idx as usize].0 == 0 {
+                    if kind == ExportKind::Func {
+                        if self.funcs[idx as usize].0 != 0 {
+                            // Only type () -> () can be exported
+                            continue;
+                        }
                         // IC function export logic
                         if canister_functions_unit_type.len() > 0 {
                             let choice = u.choose_index(canister_functions_unit_type.len())?;

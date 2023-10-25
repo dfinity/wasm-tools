@@ -934,8 +934,9 @@ impl Module {
 
         // Build up a list of candidates for each class of import
         let mut choices: Vec<Vec<(ExportKind, u32)>> = Vec::with_capacity(6);
+        // Export only locally defined functions -> InvalidFunctionIndex
         choices.push(
-            (0..self.funcs.len())
+            (self.funcs.len() - self.num_defined_funcs..self.funcs.len())
                 .map(|i| (ExportKind::Func, i as u32))
                 .collect(),
         );
@@ -975,7 +976,7 @@ impl Module {
                             continue;
                         }
                         // IC function export logic
-                        if canister_functions_unit_type.len() > 0 {
+                        if u.ratio(1, 2)? && canister_functions_unit_type.len() > 0 {
                             let choice = u.choose_index(canister_functions_unit_type.len())?;
                             name = canister_functions_unit_type[choice].to_string();
                             canister_functions_unit_type.remove(choice);

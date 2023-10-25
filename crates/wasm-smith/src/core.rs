@@ -252,7 +252,7 @@ pub(crate) enum Type {
 
 /// A function signature.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct FuncType {
+pub(crate) struct FuncType {
     /// Types of the parameter values.
     pub(crate) params: Vec<ValType>,
     /// Types of the result values.
@@ -1385,10 +1385,12 @@ impl Module {
         }
     }
 
-    /// Returns exproted globals and instrumentation fix
+    /// Returns exproted globals
     /// We disable importing globals by setting can_add_local_or_import_global to false
     pub fn exported_globals(&self) -> Vec<(GlobalType, &wasm_encoder::ConstExpr)> {
         let mut visited: BTreeSet<usize> = BTreeSet::new();
+
+        // Fetch all exported globals
         let mut exported_globals: Vec<(GlobalType, &wasm_encoder::ConstExpr)> = self
             .exports
             .iter()
@@ -1413,6 +1415,7 @@ impl Module {
             })
             .collect();
 
+        // During instrumentation mutable globals are exported
         let mutable_globals: Vec<(GlobalType, &wasm_encoder::ConstExpr)> = self
             .globals
             .clone()
@@ -1446,16 +1449,6 @@ impl Module {
     /// Returns exports
     pub fn exports(&self) -> Vec<(String, ExportKind, u32)> {
         self.exports.clone()
-    }
-
-    /// Returns globals
-    pub fn globals(&self) -> Vec<GlobalType> {
-        self.globals.clone()
-    }
-
-    /// Returns functions
-    pub fn functions(&self) -> Vec<(u32, Rc<FuncType>)> {
-        self.funcs.clone()
     }
 }
 

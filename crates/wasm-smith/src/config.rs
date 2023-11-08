@@ -476,6 +476,35 @@ pub trait Config: 'static + std::fmt::Debug {
     fn disallow_traps(&self) -> bool {
         false
     }
+
+    /// Disallow exporting certain names
+    ///
+    /// Defaults to `vec![]`
+    fn disallow_export_names(&self) -> Option<Cow<'_, [String]>> {
+        None
+    }
+
+    /// Disallow importing tags
+    ///
+    /// Defaults to `false`
+    fn disallow_import_tags(&self) -> bool {
+        false
+    }
+
+    /// Disallow importing globals
+    ///
+    /// Defaults to `false`
+    fn disallow_import_globals(&self) -> bool {
+        false
+    }
+
+    /// Only export local functions
+    ///
+    /// Supercedes `export_everything`
+    /// Defaults to `false`
+    fn disallow_export_of_import_funcs(&self) -> bool {
+        false
+    }
 }
 
 /// The default configuration.
@@ -552,6 +581,10 @@ pub struct SwarmConfig {
     pub allowed_instructions: InstructionKinds,
     pub max_table_elements: u32,
     pub table_max_size_required: bool,
+    pub disallow_export_names: Option<Vec<String>>,
+    pub disallow_import_tags: bool,
+    pub disallow_import_globals: bool,
+    pub disallow_export_of_import_funcs: bool,
 }
 
 impl<'a> Arbitrary<'a> for SwarmConfig {
@@ -628,6 +661,10 @@ impl<'a> Arbitrary<'a> for SwarmConfig {
             export_everything: false,
             disallow_traps: false,
             tail_call_enabled: false,
+            disallow_export_names: None,
+            disallow_import_tags: false,
+            disallow_import_globals: false,
+            disallow_export_of_import_funcs: false,
         })
     }
 }
@@ -833,5 +870,23 @@ impl Config for SwarmConfig {
 
     fn disallow_traps(&self) -> bool {
         self.disallow_traps
+    }
+
+    fn disallow_export_names(&self) -> Option<Cow<'_, [String]>> {
+        self.disallow_export_names
+            .as_ref()
+            .map(|is| Cow::Borrowed(&is[..]))
+    }
+
+    fn disallow_import_tags(&self) -> bool {
+        self.disallow_import_tags
+    }
+
+    fn disallow_import_globals(&self) -> bool {
+        self.disallow_import_globals
+    }
+
+    fn disallow_export_of_import_funcs(&self) -> bool {
+        self.disallow_export_of_import_funcs
     }
 }

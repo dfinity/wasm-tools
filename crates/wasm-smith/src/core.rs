@@ -200,14 +200,7 @@ impl Module {
             code: Vec::new(),
             data: Vec::new(),
             type_size: 0,
-            export_names: HashSet::from([
-                "canister counter_instructions".to_string(),
-                "canister_start".to_string(),
-                "canister counter_dirty_pages".to_string(),
-                "canister counter_accessed_page".to_string(),
-                "stable_memory".to_string(),
-                "stable_bytemap_memory".to_string(),
-            ]),
+            export_names: HashSet::new(),
         }
     }
 }
@@ -356,6 +349,12 @@ pub(crate) enum GlobalInitExpr {
 
 impl Module {
     fn build(&mut self, u: &mut Unstructured, allow_invalid: bool) -> Result<()> {
+        if let Some(disallow_exports) = self.config.disallow_export_names() {
+            for name in disallow_exports.into_owned().iter() {
+                self.export_names.insert(name.clone());
+            }
+        }
+
         self.valtypes = configured_valtypes(&*self.config);
 
         // We attempt to figure out our available imports *before* creating the types section here,
@@ -434,7 +433,10 @@ impl Module {
     }
 
     fn can_add_local_or_import_tag(&self) -> bool {
-        false
+        !self.config.disallow_import_tags()
+            && self.config.exceptions_enabled()
+            && self.has_tag_func_types()
+            && self.tags.len() < self.config.max_tags()
     }
 
     fn can_add_local_or_import_func(&self) -> bool {
@@ -446,7 +448,7 @@ impl Module {
     }
 
     fn can_add_local_or_import_global(&self) -> bool {
-        false
+        !self.config.disallow_import_globals() && self.globals.len() < self.config.max_globals()
     }
 
     fn can_add_local_or_import_memory(&self) -> bool {
@@ -934,9 +936,14 @@ impl Module {
 
         // Build up a list of candidates for each class of import
         let mut choices: Vec<Vec<(ExportKind, u32)>> = Vec::with_capacity(6);
-        // Export only locally defined functions -> InvalidFunctionIndex
+        let export_func_start_index: usize;
+        if self.config.disallow_export_of_import_funcs() {
+            export_func_start_index = self.funcs.len() - self.num_defined_funcs;
+        } else {
+            export_func_start_index = 0;
+        }
         choices.push(
-            (self.funcs.len() - self.num_defined_funcs..self.funcs.len())
+            (export_func_start_index..self.funcs.len())
                 .map(|i| (ExportKind::Func, i as u32))
                 .collect(),
         );

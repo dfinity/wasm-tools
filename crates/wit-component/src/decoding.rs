@@ -3,9 +3,9 @@ use indexmap::{IndexMap, IndexSet};
 use std::collections::HashMap;
 use std::mem;
 use wasmparser::{
-    names::{KebabName, KebabNameKind},
-    types, ComponentExport, ComponentExternName, ComponentExternalKind, ComponentImport, Parser,
-    Payload, PrimitiveValType, ValidPayload, Validator, WasmFeatures,
+    names::{ComponentName, ComponentNameKind},
+    types, ComponentExport, ComponentExternalKind, ComponentImport, Parser, Payload,
+    PrimitiveValType, ValidPayload, Validator, WasmFeatures,
 };
 use wit_parser::*;
 
@@ -17,7 +17,7 @@ struct ComponentInfo<'a> {
     /// validated.
     types: types::Types,
     /// List of all imports and exports from this component.
-    externs: Vec<(ComponentExternName<'a>, Extern<'a>)>,
+    externs: Vec<(&'a str, Extern<'a>)>,
     /// Decoded package docs
     package_docs: Option<PackageDocs>,
 }
@@ -61,13 +61,13 @@ impl<'a> ComponentInfo<'a> {
                 Payload::ComponentImportSection(s) if depth == 1 => {
                     for import in s {
                         let import = import?;
-                        externs.push((import.name, Extern::Import(import)));
+                        externs.push((import.name.0, Extern::Import(import)));
                     }
                 }
                 Payload::ComponentExportSection(s) if depth == 1 => {
                     for export in s {
                         let export = export?;
-                        externs.push((export.name, Extern::Export(export)));
+                        externs.push((export.name.0, Extern::Export(export)));
                     }
                 }
                 Payload::CustomSection(s) if s.name() == PACKAGE_DOCS_SECTION_NAME => {
@@ -113,26 +113,17 @@ impl<'a> ComponentInfo<'a> {
         // strings for each component. The v1 format uses "<namespace>:<package>/wit" as the name
         // for the top-level exports, while the v2 format uses the unqualified name of the encoded
         // entity.
-        match KebabName::new(self.externs[0].0, 0).ok()?.kind() {
-            KebabNameKind::Id { interface, .. } if interface.as_str() == "wit" => {
+        match ComponentName::new(self.externs[0].0, 0).ok()?.kind() {
+            ComponentNameKind::Interface(name) if name.interface().as_str() == "wit" => {
                 Some(WitEncodingVersion::V1)
             }
-            KebabNameKind::Normal(_) => Some(WitEncodingVersion::V2),
+            ComponentNameKind::Label(_) => Some(WitEncodingVersion::V2),
             _ => None,
         }
     }
 
     fn decode_wit_v1_package(&self) -> Result<(Resolve, PackageId)> {
-        let resolve = Resolve::default();
-        let mut decoder = WitPackageDecoder {
-            resolve,
-            info: self,
-            type_map: HashMap::new(),
-            foreign_packages: Default::default(),
-            iface_to_package_index: Default::default(),
-            named_interfaces: Default::default(),
-            resources: Default::default(),
-        };
+        let mut decoder = WitPackageDecoder::new(&self.types);
 
         let mut pkg = None;
         for (name, item) in self.externs.iter() {
@@ -145,7 +136,7 @@ impl<'a> ComponentInfo<'a> {
             if pkg.is_some() {
                 bail!("more than one top-level exported component type found");
             }
-            let name = KebabName::new(*name, 0).unwrap();
+            let name = ComponentName::new(*name, 0).unwrap();
             pkg = Some(
                 decoder
                     .decode_v1_package(&name, ty)
@@ -162,16 +153,7 @@ impl<'a> ComponentInfo<'a> {
     }
 
     fn decode_wit_v2_package(&self) -> Result<(Resolve, PackageId)> {
-        let resolve = Resolve::default();
-        let mut decoder = WitPackageDecoder {
-            resolve,
-            info: self,
-            type_map: HashMap::new(),
-            foreign_packages: Default::default(),
-            iface_to_package_index: Default::default(),
-            named_interfaces: Default::default(),
-            resources: Default::default(),
-        };
+        let mut decoder = WitPackageDecoder::new(&self.types);
 
         let mut pkg_name = None;
 
@@ -252,12 +234,12 @@ impl<'a> ComponentInfo<'a> {
 
     fn decode_component(&self) -> Result<(Resolve, WorldId)> {
         assert!(self.is_wit_package().is_none());
-        let mut resolve = Resolve::default();
+        let mut decoder = WitPackageDecoder::new(&self.types);
         // Note that this name is arbitrarily chosen. We may one day perhaps
         // want to encode this in the component binary format itself, but for
         // now it shouldn't be an issue to have a defaulted name here.
         let world_name = "root";
-        let world = resolve.worlds.alloc(World {
+        let world = decoder.resolve.worlds.alloc(World {
             name: world_name.to_string(),
             docs: Default::default(),
             imports: Default::default(),
@@ -266,15 +248,6 @@ impl<'a> ComponentInfo<'a> {
             includes: Default::default(),
             include_names: Default::default(),
         });
-        let mut decoder = WitPackageDecoder {
-            resolve,
-            info: self,
-            type_map: HashMap::new(),
-            foreign_packages: Default::default(),
-            iface_to_package_index: Default::default(),
-            named_interfaces: Default::default(),
-            resources: Default::default(),
-        };
         let mut package = Package {
             // Similar to `world_name` above this is arbitrarily chosen as it's
             // not otherwise encoded in a binary component. This theoretically
@@ -371,6 +344,48 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedWasm> {
     }
 }
 
+/// Decodes the single component type `world` specified as a WIT world.
+///
+/// The `world` should be an exported component type. The `world` must have been
+/// previously created via `encode_world` meaning that it is a component that
+/// itself imports nothing and exports a single component, and the single
+/// component export represents the world. The name of the export is also the
+/// name of the package/world/etc.
+pub(crate) fn decode_world(
+    types: &types::Types,
+    world: types::ComponentTypeId,
+) -> Result<(Resolve, WorldId)> {
+    let mut decoder = WitPackageDecoder::new(types);
+    let mut interfaces = IndexMap::new();
+    let mut worlds = IndexMap::new();
+    let ty = &types[world];
+    assert_eq!(ty.imports.len(), 0);
+    assert_eq!(ty.exports.len(), 1);
+    let name = ty.exports.keys().nth(0).unwrap();
+    let ty = match ty.exports[0] {
+        types::ComponentEntityType::Component(ty) => ty,
+        _ => unreachable!(),
+    };
+    let name = decoder.decode_world(
+        name,
+        &types[ty],
+        &mut PackageFields {
+            interfaces: &mut interfaces,
+            worlds: &mut worlds,
+        },
+    )?;
+    let (resolve, pkg) = decoder.finish(Package {
+        name,
+        interfaces,
+        worlds,
+        docs: Default::default(),
+    });
+    // The package decoded here should only have a single world so extract that
+    // here to return.
+    let world = *resolve.packages[pkg].worlds.iter().next().unwrap().1;
+    Ok((resolve, world))
+}
+
 struct PackageFields<'a> {
     interfaces: &'a mut IndexMap<String, InterfaceId>,
     worlds: &'a mut IndexMap<String, WorldId>,
@@ -378,7 +393,7 @@ struct PackageFields<'a> {
 
 struct WitPackageDecoder<'a> {
     resolve: Resolve,
-    info: &'a ComponentInfo<'a>,
+    types: &'a types::Types,
     foreign_packages: IndexMap<String, Package>,
     iface_to_package_index: HashMap<InterfaceId, usize>,
     named_interfaces: HashMap<String, InterfaceId>,
@@ -397,16 +412,28 @@ struct WitPackageDecoder<'a> {
 }
 
 impl WitPackageDecoder<'_> {
+    fn new<'a>(types: &'a types::Types) -> WitPackageDecoder<'a> {
+        WitPackageDecoder {
+            resolve: Resolve::default(),
+            types,
+            type_map: HashMap::new(),
+            foreign_packages: Default::default(),
+            iface_to_package_index: Default::default(),
+            named_interfaces: Default::default(),
+            resources: Default::default(),
+        }
+    }
+
     fn decode_v1_package(
         &mut self,
-        name: &KebabName,
+        name: &ComponentName,
         ty: &types::ComponentType,
     ) -> Result<Package> {
         // Process all imports for this package first, where imports are
         // importing from remote packages.
         for (name, ty) in ty.imports.iter() {
             let ty = match ty {
-                types::ComponentEntityType::Instance(idx) => &self.info.types[*idx],
+                types::ComponentEntityType::Instance(idx) => &self.types[*idx],
                 _ => bail!("import `{name}` is not an instance"),
             };
             self.register_import(name, ty)
@@ -418,16 +445,9 @@ impl WitPackageDecoder<'_> {
             // where "wit" is just a placeholder for now. The package name in
             // this case would be `foo:bar`.
             name: match name.kind() {
-                KebabNameKind::Id {
-                    namespace,
-                    package,
-                    version,
-                    interface,
-                } if interface.as_str() == "wit" => PackageName {
-                    namespace: namespace.to_string(),
-                    name: package.to_string(),
-                    version,
-                },
+                ComponentNameKind::Interface(name) if name.interface().as_str() == "wit" => {
+                    name.to_package_name()
+                }
                 _ => bail!("package name is not a valid id: {name}"),
             },
             docs: Default::default(),
@@ -443,12 +463,12 @@ impl WitPackageDecoder<'_> {
         for (name, ty) in ty.exports.iter() {
             match ty {
                 types::ComponentEntityType::Instance(idx) => {
-                    let ty = &self.info.types[*idx];
+                    let ty = &self.types[*idx];
                     self.register_interface(name.as_str(), ty, &mut fields)
                         .with_context(|| format!("failed to process export `{name}`"))?;
                 }
                 types::ComponentEntityType::Component(idx) => {
-                    let ty = &self.info.types[*idx];
+                    let ty = &self.types[*idx];
                     self.register_world(name.as_str(), ty, &mut fields)
                         .with_context(|| format!("failed to process export `{name}`"))?;
                 }
@@ -465,27 +485,18 @@ impl WitPackageDecoder<'_> {
         ty: &types::ComponentInstanceType,
         fields: &mut PackageFields<'a>,
     ) -> Result<PackageName> {
-        let kebab_name = self
-            .extract_kebab_name(name)
+        let component_name = self
+            .parse_component_name(name)
             .context("expected world name to have an ID form")?;
 
-        let package = match kebab_name.kind() {
-            KebabNameKind::Id {
-                namespace,
-                package,
-                version,
-                ..
-            } => PackageName {
-                namespace: namespace.to_string(),
-                name: package.to_string(),
-                version,
-            },
+        let package = match component_name.kind() {
+            ComponentNameKind::Interface(name) => name.to_package_name(),
             _ => bail!("expected world name to be fully qualified"),
         };
 
         for (name, ty) in imports.iter() {
             let ty = match ty {
-                types::ComponentEntityType::Instance(idx) => &self.info.types[*idx],
+                types::ComponentEntityType::Instance(idx) => &self.types[*idx],
                 _ => bail!("import `{name}` is not an instance"),
             };
             self.register_import(name, ty)
@@ -504,20 +515,11 @@ impl WitPackageDecoder<'_> {
         fields: &mut PackageFields<'a>,
     ) -> Result<PackageName> {
         let kebab_name = self
-            .extract_kebab_name(name)
+            .parse_component_name(name)
             .context("expected world name to have an ID form")?;
 
         let package = match kebab_name.kind() {
-            KebabNameKind::Id {
-                namespace,
-                package,
-                version,
-                ..
-            } => PackageName {
-                namespace: namespace.to_string(),
-                name: package.to_string(),
-                version,
-            },
+            ComponentNameKind::Interface(name) => name.to_package_name(),
             _ => bail!("expected world name to be fully qualified"),
         };
 
@@ -532,17 +534,13 @@ impl WitPackageDecoder<'_> {
         world: WorldId,
         package: &mut PackageFields<'a>,
     ) -> Result<()> {
-        let name = import.name.as_str();
+        let name = import.name.0;
         log::debug!("decoding component import `{name}`");
-        let ty = self
-            .info
-            .types
-            .component_entity_type_of_import(import.name.as_str())
-            .unwrap();
+        let ty = self.types.component_entity_type_of_import(name).unwrap();
         let owner = TypeOwner::World(world);
         let (name, item) = match ty {
             types::ComponentEntityType::Instance(i) => {
-                let ty = &self.info.types[i];
+                let ty = &self.types[i];
                 let (name, id) = if name.contains('/') {
                     let id = self.register_import(name, ty)?;
                     (WorldKey::Interface(id), id)
@@ -553,7 +551,7 @@ impl WitPackageDecoder<'_> {
                 (name, WorldItem::Interface(id))
             }
             types::ComponentEntityType::Func(i) => {
-                let ty = &self.info.types[i];
+                let ty = &self.types[i];
                 let func = self
                     .convert_function(name, ty, owner)
                     .with_context(|| format!("failed to decode function from import `{name}`"))?;
@@ -581,9 +579,9 @@ impl WitPackageDecoder<'_> {
         world: WorldId,
         package: &mut PackageFields<'a>,
     ) -> Result<()> {
-        let name = export.name.as_str();
+        let name = export.name.0;
         log::debug!("decoding component export `{name}`");
-        let types = &self.info.types;
+        let types = &self.types;
         let ty = types.component_entity_type_of_export(name).unwrap();
         let (name, item) = match ty {
             types::ComponentEntityType::Func(i) => {
@@ -665,7 +663,7 @@ impl WitPackageDecoder<'_> {
                             log::debug!("type already exist");
                             match referenced {
                                 types::ComponentAnyTypeId::Defined(ty) => {
-                                    self.register_defined(id, &self.info.types[ty])?;
+                                    self.register_defined(id, &self.types[ty])?;
                                 }
                                 types::ComponentAnyTypeId::Resource(_) => {}
                                 _ => unreachable!(),
@@ -709,7 +707,7 @@ impl WitPackageDecoder<'_> {
                 // functions for remote dependencies and otherwise assert
                 // they're already defined for local dependencies.
                 types::ComponentEntityType::Func(ty) => {
-                    let def = &self.info.types[ty];
+                    let def = &self.types[ty];
                     if self.resolve.interfaces[interface]
                         .functions
                         .contains_key(name.as_str())
@@ -746,7 +744,7 @@ impl WitPackageDecoder<'_> {
         let mut cur = id;
         while prev.is_none() {
             prev = self.type_map.get(&cur).copied();
-            cur = match self.info.types.peel_alias(cur) {
+            cur = match self.types.peel_alias(cur) {
                 Some(next) => next,
                 None => break,
             };
@@ -757,26 +755,12 @@ impl WitPackageDecoder<'_> {
     /// This will parse the `name_string` as a component model ID string and
     /// ensure that there's an `InterfaceId` corresponding to its components.
     fn extract_dep_interface(&mut self, name_string: &str) -> Result<InterfaceId> {
-        let import_name = if name_string.contains('/') {
-            ComponentExternName::Interface(name_string)
-        } else {
-            ComponentExternName::Kebab(name_string)
-        };
-        let name = KebabName::new(import_name, 0).unwrap();
-        let (namespace, name, version, interface) = match name.kind() {
-            KebabNameKind::Id {
-                namespace,
-                package,
-                version,
-                interface,
-            } => (namespace, package, version, interface),
+        let name = ComponentName::new(name_string, 0).unwrap();
+        let name = match name.kind() {
+            ComponentNameKind::Interface(name) => name,
             _ => bail!("package name is not a valid id: {name_string}"),
         };
-        let package_name = PackageName {
-            name: name.to_string(),
-            namespace: namespace.to_string(),
-            version,
-        };
+        let package_name = name.to_package_name();
         // Lazily create a `Package` as necessary, along with the interface.
         let package = self
             .foreign_packages
@@ -789,10 +773,10 @@ impl WitPackageDecoder<'_> {
             });
         let interface = *package
             .interfaces
-            .entry(interface.to_string())
+            .entry(name.interface().to_string())
             .or_insert_with(|| {
                 self.resolve.interfaces.alloc(Interface {
-                    name: Some(interface.to_string()),
+                    name: Some(name.interface().to_string()),
                     docs: Default::default(),
                     types: IndexMap::default(),
                     functions: IndexMap::new(),
@@ -843,7 +827,7 @@ impl WitPackageDecoder<'_> {
         // If this is a bare kebab-name for an interface then the interface's
         // listed name is `None` and the name goes out through the key.
         // Otherwise this name is extracted from `name` interpreted as an ID.
-        let interface_name = self.extract_interface_name_from_kebab_name(name)?;
+        let interface_name = self.extract_interface_name_from_component_name(name)?;
 
         let mut interface = Interface {
             name: interface_name.clone(),
@@ -868,7 +852,7 @@ impl WitPackageDecoder<'_> {
                 }
 
                 types::ComponentEntityType::Func(ty) => {
-                    let ty = &self.info.types[ty];
+                    let ty = &self.types[ty];
                     let func = self
                         .convert_function(name.as_str(), ty, owner)
                         .with_context(|| format!("failed to convert function '{name}'"))?;
@@ -898,21 +882,16 @@ impl WitPackageDecoder<'_> {
         Ok((key, id))
     }
 
-    fn extract_kebab_name(&self, name: &str) -> Result<KebabName> {
-        let import_name = if name.contains('/') {
-            ComponentExternName::Interface(name)
-        } else {
-            ComponentExternName::Kebab(name)
-        };
-        KebabName::new(import_name, 0)
+    fn parse_component_name(&self, name: &str) -> Result<ComponentName> {
+        ComponentName::new(name, 0)
             .with_context(|| format!("cannot extract item name from: {name}"))
     }
 
-    fn extract_interface_name_from_kebab_name(&self, name: &str) -> Result<Option<String>> {
-        let kebab_name = self.extract_kebab_name(name)?;
-        match kebab_name.kind() {
-            KebabNameKind::Id { interface, .. } => Ok(Some(interface.to_string())),
-            KebabNameKind::Normal(_name) => Ok(None),
+    fn extract_interface_name_from_component_name(&self, name: &str) -> Result<Option<String>> {
+        let component_name = self.parse_component_name(name)?;
+        match component_name.kind() {
+            ComponentNameKind::Interface(name) => Ok(Some(name.interface().to_string())),
+            ComponentNameKind::Label(_name) => Ok(None),
             _ => bail!("cannot extract item name from: {name}"),
         }
     }
@@ -939,7 +918,7 @@ impl WitPackageDecoder<'_> {
                 log::debug!("type export for `{name}` is a new type");
                 match referenced {
                     types::ComponentAnyTypeId::Defined(ty) => self
-                        .convert_defined(&self.info.types[ty])
+                        .convert_defined(&self.types[ty])
                         .context("failed to convert unaliased type")?,
                     types::ComponentAnyTypeId::Resource(_) => TypeDefKind::Resource,
                     _ => unreachable!(),
@@ -977,7 +956,7 @@ impl WitPackageDecoder<'_> {
         package: &mut PackageFields<'a>,
     ) -> Result<WorldId> {
         let name = self
-            .extract_interface_name_from_kebab_name(name)?
+            .extract_interface_name_from_component_name(name)?
             .context("expected world name to have an ID form")?;
         let mut world = World {
             name: name.clone(),
@@ -993,7 +972,7 @@ impl WitPackageDecoder<'_> {
         for (name, ty) in ty.imports.iter() {
             let (name, item) = match ty {
                 types::ComponentEntityType::Instance(idx) => {
-                    let ty = &self.info.types[*idx];
+                    let ty = &self.types[*idx];
                     let (name, id) = if name.contains('/') {
                         // If a name is an interface import then it is either to
                         // a package-local or foreign interface, and both
@@ -1018,7 +997,7 @@ impl WitPackageDecoder<'_> {
                     (WorldKey::Name(name.to_string()), WorldItem::Type(ty))
                 }
                 types::ComponentEntityType::Func(idx) => {
-                    let ty = &self.info.types[*idx];
+                    let ty = &self.types[*idx];
                     let func = self.convert_function(name.as_str(), ty, owner)?;
                     (WorldKey::Name(name.to_string()), WorldItem::Function(func))
                 }
@@ -1030,7 +1009,7 @@ impl WitPackageDecoder<'_> {
         for (name, ty) in ty.exports.iter() {
             let (name, item) = match ty {
                 types::ComponentEntityType::Instance(idx) => {
-                    let ty = &self.info.types[*idx];
+                    let ty = &self.types[*idx];
                     let (name, id) = if name.contains('/') {
                         // Note that despite this being an export this is
                         // calling `register_import`. With a URL this interface
@@ -1047,7 +1026,7 @@ impl WitPackageDecoder<'_> {
                 }
 
                 types::ComponentEntityType::Func(idx) => {
-                    let ty = &self.info.types[*idx];
+                    let ty = &self.types[*idx];
                     let func = self.convert_function(name.as_str(), ty, owner)?;
                     (WorldKey::Name(name.to_string()), WorldItem::Function(func))
                 }
@@ -1068,7 +1047,7 @@ impl WitPackageDecoder<'_> {
         ty: &types::ComponentFuncType,
         owner: TypeOwner,
     ) -> Result<Function> {
-        let name = KebabName::new(ComponentExternName::Kebab(name), 0).unwrap();
+        let name = ComponentName::new(name, 0).unwrap();
         let params = ty
             .params
             .iter()
@@ -1097,19 +1076,22 @@ impl WitPackageDecoder<'_> {
         Ok(Function {
             docs: Default::default(),
             kind: match name.kind() {
-                KebabNameKind::Normal(_) => FunctionKind::Freestanding,
-                KebabNameKind::Constructor(resource) => {
+                ComponentNameKind::Label(_) => FunctionKind::Freestanding,
+                ComponentNameKind::Constructor(resource) => {
                     FunctionKind::Constructor(self.resources[&owner][resource.as_str()])
                 }
-                KebabNameKind::Method { resource, .. } => {
-                    FunctionKind::Method(self.resources[&owner][resource.as_str()])
+                ComponentNameKind::Method(name) => {
+                    FunctionKind::Method(self.resources[&owner][name.resource().as_str()])
                 }
-                KebabNameKind::Static { resource, .. } => {
-                    FunctionKind::Static(self.resources[&owner][resource.as_str()])
+                ComponentNameKind::Static(name) => {
+                    FunctionKind::Static(self.resources[&owner][name.resource().as_str()])
                 }
 
                 // Functions shouldn't have ID-based names at this time.
-                KebabNameKind::Id { .. } => unreachable!(),
+                ComponentNameKind::Interface(_)
+                | ComponentNameKind::Url(_)
+                | ComponentNameKind::Hash(_)
+                | ComponentNameKind::Dependency(_) => unreachable!(),
             },
 
             // Note that this name includes "name mangling" such as
@@ -1138,7 +1120,7 @@ impl WitPackageDecoder<'_> {
         // errors on those types, but eventually the `bail!` here  is
         // more-or-less unreachable due to expected validation to be added to
         // the component model binary format itself.
-        let def = &self.info.types[id];
+        let def = &self.types[id];
         let kind = self.convert_defined(def)?;
         match &kind {
             TypeDefKind::Type(_)
@@ -1303,7 +1285,7 @@ impl WitPackageDecoder<'_> {
 
     fn register_defined(&mut self, id: TypeId, def: &types::ComponentDefinedType) -> Result<()> {
         Registrar {
-            types: &self.info.types,
+            types: &self.types,
             type_map: &mut self.type_map,
             resolve: &self.resolve,
         }
@@ -1353,25 +1335,56 @@ impl WitPackageDecoder<'_> {
     }
 
     fn insert_package(&mut self, package: Package) -> PackageId {
-        let name = package.name.clone();
-        let id = self.resolve.packages.alloc(package);
-        let prev = self.resolve.package_names.insert(name, id);
-        assert!(prev.is_none());
-        for (_, iface) in self.resolve.packages[id].interfaces.iter() {
-            self.resolve.interfaces[*iface].package = Some(id);
+        let Package {
+            name,
+            interfaces,
+            worlds,
+            docs,
+        } = package;
+
+        // Most of the time the `package` being inserted is not already present
+        // in `self.resolve`, but in the case of the top-level `decode_world`
+        // function this isn't the case. This shouldn't in general be a problem
+        // so union-up the packages here while asserting that nothing gets
+        // replaced by accident which would indicate a bug.
+        let pkg = self
+            .resolve
+            .package_names
+            .get(&name)
+            .copied()
+            .unwrap_or_else(|| {
+                let id = self.resolve.packages.alloc(Package {
+                    name: name.clone(),
+                    interfaces: Default::default(),
+                    worlds: Default::default(),
+                    docs,
+                });
+                let prev = self.resolve.package_names.insert(name, id);
+                assert!(prev.is_none());
+                id
+            });
+
+        for (name, id) in interfaces {
+            let prev = self.resolve.packages[pkg].interfaces.insert(name, id);
+            assert!(prev.is_none());
+            self.resolve.interfaces[id].package = Some(pkg);
         }
-        for (_, world) in self.resolve.packages[id].worlds.iter() {
-            self.resolve.worlds[*world].package = Some(id);
-            let world = &self.resolve.worlds[*world];
+
+        for (name, id) in worlds {
+            let prev = self.resolve.packages[pkg].worlds.insert(name, id);
+            assert!(prev.is_none());
+            let world = &mut self.resolve.worlds[id];
+            world.package = Some(pkg);
             for (name, item) in world.imports.iter().chain(world.exports.iter()) {
                 if let WorldKey::Name(_) = name {
                     if let WorldItem::Interface(iface) = item {
-                        self.resolve.interfaces[*iface].package = Some(id);
+                        self.resolve.interfaces[*iface].package = Some(pkg);
                     }
                 }
             }
         }
-        id
+
+        pkg
     }
 
     fn visit_package(&self, idx: usize, order: &mut IndexSet<usize>) {
@@ -1630,5 +1643,19 @@ impl Registrar<'_> {
         // refactoring.
         let _ = prev;
         Ok(())
+    }
+}
+
+pub(crate) trait InterfaceNameExt {
+    fn to_package_name(&self) -> PackageName;
+}
+
+impl InterfaceNameExt for wasmparser::names::InterfaceName<'_> {
+    fn to_package_name(&self) -> PackageName {
+        PackageName {
+            namespace: self.namespace().to_string(),
+            name: self.package().to_string(),
+            version: self.version(),
+        }
     }
 }

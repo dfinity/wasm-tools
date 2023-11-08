@@ -3,6 +3,7 @@
 use crate::InstructionKinds;
 use arbitrary::{Arbitrary, Result, Unstructured};
 use std::borrow::Cow;
+use wasm_encoder::ValType;
 
 /// Configuration for a generated module.
 ///
@@ -479,7 +480,7 @@ pub trait Config: 'static + std::fmt::Debug {
 
     /// Disallow exporting certain names
     ///
-    /// Defaults to `vec![]`
+    /// Defaults to `None`
     fn disallow_export_names(&self) -> Option<Cow<'_, [String]>> {
         None
     }
@@ -504,6 +505,27 @@ pub trait Config: 'static + std::fmt::Debug {
     /// Defaults to `false`
     fn disallow_export_of_import_funcs(&self) -> bool {
         false
+    }
+
+    /// Function names to export once
+    ///
+    /// Defaults to `None`
+    fn export_func_name(&self) -> Option<Cow<'_, [String]>> {
+        None
+    }
+
+    /// Prefix for exported function names
+    ///
+    /// Defaults to `None`
+    fn export_func_name_prefix(&self) -> Option<Cow<'_, [String]>> {
+        None
+    }
+
+    /// Set function types
+    ///
+    /// Defaults to `None`
+    fn func_types(&self) -> Option<Cow<'_, [(Vec<ValType>, Vec<ValType>)]>> {
+        None
     }
 }
 
@@ -585,6 +607,9 @@ pub struct SwarmConfig {
     pub disallow_import_tags: bool,
     pub disallow_import_globals: bool,
     pub disallow_export_of_import_funcs: bool,
+    pub export_func_name: Option<Vec<String>>,
+    pub export_func_name_prefix: Option<Vec<String>>,
+    pub func_types: Option<Vec<(Vec<ValType>, Vec<ValType>)>>,
 }
 
 impl<'a> Arbitrary<'a> for SwarmConfig {
@@ -665,6 +690,9 @@ impl<'a> Arbitrary<'a> for SwarmConfig {
             disallow_import_tags: false,
             disallow_import_globals: false,
             disallow_export_of_import_funcs: false,
+            export_func_name: None,
+            export_func_name_prefix: None,
+            func_types: None,
         })
     }
 }
@@ -888,5 +916,21 @@ impl Config for SwarmConfig {
 
     fn disallow_export_of_import_funcs(&self) -> bool {
         self.disallow_export_of_import_funcs
+    }
+
+    fn export_func_name(&self) -> Option<Cow<'_, [String]>> {
+        self.export_func_name
+            .as_ref()
+            .map(|is| Cow::Borrowed(&is[..]))
+    }
+
+    fn export_func_name_prefix(&self) -> Option<Cow<'_, [String]>> {
+        self.export_func_name_prefix
+            .as_ref()
+            .map(|is| Cow::Borrowed(&is[..]))
+    }
+
+    fn func_types(&self) -> Option<Cow<'_, [(Vec<ValType>, Vec<ValType>)]>> {
+        self.func_types.as_ref().map(|is| Cow::Borrowed(&is[..]))
     }
 }

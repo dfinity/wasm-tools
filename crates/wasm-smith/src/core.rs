@@ -392,13 +392,16 @@ impl Module {
         let min = self.config.min_types().saturating_sub(self.types.len());
         let max = self.config.max_types().saturating_sub(self.types.len());
 
-        // Record a () -> () type for canister exports
-        let ty = Type::Func(Rc::new(FuncType {
-            params: vec![],
-            results: vec![],
-        }));
-        self.record_type(&ty);
-        self.types.push(ty);
+        if let Some(func_types) = self.config.func_types() {
+            for new_type in func_types.into_owned().iter() {
+                let ty = Type::Func(Rc::new(FuncType {
+                    params: (*new_type.0).to_vec(),
+                    results: (*new_type.1).to_vec(),
+                }));
+                self.record_type(&ty);
+                self.types.push(ty);
+            }
+        }
 
         arbitrary_loop(u, min, max, |u| {
             let ty = self.arbitrary_type(u)?;
@@ -962,46 +965,15 @@ impl Module {
                 .map(|i| (ExportKind::Global, i as u32))
                 .collect(),
         );
-        let mut canister_functions_unit_type: Vec<&str> = vec![
-            "canister_init",
-            "canister_inspect_message",
-            "canister_pre_upgrade",
-            "canister_post_upgrade",
-            "canister_heartbeat",
-            "canister_global_timer",
-        ];
 
         // If the configuration demands exporting everything, we do so here and
         // early-return.
+        let mut visited: BTreeSet<usize> = BTreeSet::new();
+
         if self.config.export_everything() {
             for choices_by_kind in choices {
                 for (kind, idx) in choices_by_kind {
-                    let name;
-                    if kind == ExportKind::Func {
-                        if self.funcs[idx as usize].0 != 0 {
-                            // Only type () -> () can be exported
-                            continue;
-                        }
-                        // IC function export logic
-                        if u.ratio(1, 2)? && canister_functions_unit_type.len() > 0 {
-                            let choice = u.choose_index(canister_functions_unit_type.len())?;
-                            name = canister_functions_unit_type[choice].to_string();
-                            canister_functions_unit_type.remove(choice);
-                        } else {
-                            let suffix = unique_string(1_000, &mut self.export_names, u)?;
-                            if u.ratio(1, 3)? {
-                                name = format!("canister_update {}", suffix);
-                            } else {
-                                if u.ratio(1, 2)? {
-                                    name = format!("canister_query {}", suffix);
-                                } else {
-                                    name = format!("canister_composite_query {}", suffix);
-                                }
-                            }
-                        }
-                    } else {
-                        name = unique_string(1_000, &mut self.export_names, u)?;
-                    }
+                    let name = self.export_name(u, kind, idx, &mut visited)?;
                     self.add_arbitrary_export(name, kind, idx)?;
                 }
             }
@@ -1029,9 +1001,9 @@ impl Module {
 
                 // Pick a name, then pick the export, and then we can record
                 // information about the chosen export.
-                let name = unique_string(1_000, &mut self.export_names, u)?;
                 let list = u.choose(&choices)?;
                 let (kind, idx) = *u.choose(list)?;
+                let name = self.export_name(u, kind, idx, &mut visited)?;
                 self.add_arbitrary_export(name, kind, idx)?;
                 Ok(true)
             },
@@ -1390,6 +1362,55 @@ impl Module {
                 (ty.params.to_vec(), ty.results.to_vec())
             }
         }
+    }
+
+    fn export_name(
+        &mut self,
+        u: &mut Unstructured,
+        kind: ExportKind,
+        idx: u32,
+        visited: &mut BTreeSet<usize>,
+    ) -> Result<String> {
+        let mut name = unique_string(1_000, &mut self.export_names, u)?;
+
+        if kind != ExportKind::Func {
+            return Ok(name);
+        }
+
+        if self.funcs[idx as usize].0 != 0 {
+            // Only type () -> () can be exported
+            return Ok(name);
+        }
+
+        if u.ratio(1, 2)?
+            && self
+                .config
+                .export_func_name()
+                .is_some_and(|v| v.into_owned().len() != visited.len())
+        {
+            let export_func_name = self.config.export_func_name().unwrap().into_owned();
+            let index_choice: Vec<usize> = (0..export_func_name.len())
+                .filter_map(|index| {
+                    if !visited.contains(&index) {
+                        return Some(index);
+                    }
+                    None
+                })
+                .collect();
+            let choice = u.choose(&index_choice)?;
+            name = export_func_name[*choice].clone();
+            visited.insert(*choice);
+            return Ok(name);
+        }
+
+        if self.config.export_func_name_prefix().is_none() {
+            return Ok(name);
+        }
+
+        let export_func_name_prefix = self.config.export_func_name_prefix().unwrap().into_owned();
+        let choice = u.choose_index(export_func_name_prefix.len())?;
+        name = format!("{} {}", export_func_name_prefix[choice], name);
+        Ok(name)
     }
 
     /// Returns exproted globals

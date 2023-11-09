@@ -500,28 +500,34 @@ pub trait Config: 'static + std::fmt::Debug {
     }
 
     /// Only export local functions
-    ///
     /// Supercedes `export_everything`
+    ///
     /// Defaults to `false`
     fn disallow_export_of_import_funcs(&self) -> bool {
         false
     }
 
-    /// Function names to export once
+    /// Function names to export (at most) once
+    /// (IC -> Only func of type () -> ())
     ///
     /// Defaults to `None`
     fn export_func_name(&self) -> Option<Cow<'_, [String]>> {
         None
     }
 
-    /// Prefix for exported function names
+    /// Prefixes for exported function names.
+    /// Prefixes are not added for names if defined in `export_func_name`.
+    /// All other function names (IC -> Only func of type () -> ())
+    /// are prefixed with a uniformly random prefix from the provided list.
+    /// A prefix can be used more than once.
     ///
     /// Defaults to `None`
     fn export_func_name_prefix(&self) -> Option<Cow<'_, [String]>> {
         None
     }
 
-    /// Set function types
+    /// Sets specific function types to be used for functions
+    /// in addition to the arbitrarily generated types
     ///
     /// Defaults to `None`
     fn func_types(&self) -> Option<Cow<'_, [(Vec<ValType>, Vec<ValType>)]>> {

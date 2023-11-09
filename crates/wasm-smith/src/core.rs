@@ -1377,7 +1377,9 @@ impl Module {
         }
 
         if self.funcs[idx as usize].0 != 0 {
-            // Only type () -> () can be exported
+            // An IC specific fix
+            // We set config.func_types to be vec![(() , ())] ie type () -> ()
+            // IC only allows `canister *` export names to have func type () -> ()
             return Ok(name);
         }
 
@@ -1477,13 +1479,12 @@ impl Module {
         self.exports.clone()
     }
 
-    /// Returns true if export length < 20_000
-    pub fn is_total_export_length_valid(&self) -> bool {
+    /// Returns the total length of exports
+    pub fn export_length_total(&self) -> u64 {
         self.exports
             .iter()
-            .map(|(name, _, _)| name.len())
-            .sum::<usize>()
-            < 20_000
+            .map(|(name, _, _)| name.len() as u64)
+            .sum::<u64>()
     }
 }
 

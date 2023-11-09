@@ -350,9 +350,8 @@ pub(crate) enum GlobalInitExpr {
 impl Module {
     fn build(&mut self, u: &mut Unstructured, allow_invalid: bool) -> Result<()> {
         if let Some(disallow_exports) = self.config.disallow_export_names() {
-            for name in disallow_exports.into_owned().iter() {
-                self.export_names.insert(name.clone());
-            }
+            self.export_names
+                .extend(disallow_exports.into_owned().iter().cloned());
         }
 
         self.valtypes = configured_valtypes(&*self.config);
@@ -1391,10 +1390,10 @@ impl Module {
             let export_func_name = self.config.export_func_name().unwrap().into_owned();
             let index_choice: Vec<usize> = (0..export_func_name.len())
                 .filter_map(|index| {
-                    if !visited.contains(&index) {
-                        return Some(index);
+                    if visited.contains(&index) {
+                        return None;
                     }
-                    None
+                    Some(index)
                 })
                 .collect();
             let choice = u.choose(&index_choice)?;
@@ -1423,22 +1422,25 @@ impl Module {
             .exports
             .iter()
             .filter_map(|export| {
-                if export.1 == ExportKind::Global {
-                    let defined_global = self
-                        .defined_globals
-                        .iter()
-                        .find(|defined_global| defined_global.0 == export.2);
-                    if let Some(global) = defined_global {
-                        let expr = match &global.1 {
-                            GlobalInitExpr::FuncRef(_) => return None,
-                            GlobalInitExpr::ConstExpr(expr) => expr,
-                        };
+                if export.1 != ExportKind::Global {
+                    return None;
+                }
+
+                let defined_global = self
+                    .defined_globals
+                    .iter()
+                    .find(|defined_global| defined_global.0 == export.2);
+
+                if defined_global.is_none() {
+                    return None;
+                }
+
+                match &defined_global.unwrap().1 {
+                    GlobalInitExpr::FuncRef(_) => return None,
+                    GlobalInitExpr::ConstExpr(expr) => {
                         visited.insert(export.2 as usize);
                         return Some((self.globals[export.2 as usize], expr));
                     }
-                    None
-                } else {
-                    None
                 }
             })
             .collect();
@@ -1455,18 +1457,14 @@ impl Module {
                     .iter()
                     .find(|defined_global| defined_global.0 as usize == i);
 
-                if visited.contains(&i) || !g.mutable {
+                if visited.contains(&i) || !g.mutable || defined_global.is_none() {
                     return None;
                 }
 
-                if let Some(global) = defined_global {
-                    let expr = match &global.1 {
-                        GlobalInitExpr::FuncRef(_) => return None,
-                        GlobalInitExpr::ConstExpr(expr) => expr,
-                    };
-                    return Some((*g, expr));
+                match &defined_global.unwrap().1 {
+                    GlobalInitExpr::FuncRef(_) => return None,
+                    GlobalInitExpr::ConstExpr(expr) => return Some((*g, expr)),
                 }
-                None
             })
             .collect();
 

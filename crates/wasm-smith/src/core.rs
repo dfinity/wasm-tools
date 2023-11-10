@@ -1372,6 +1372,12 @@ impl Module {
     ) -> Result<String> {
         let mut name = unique_string(1_000, &mut self.export_names, u)?;
 
+        if let Some(disallowed_prefix) = self.config.disallow_export_name_prefix() {
+            for prefix in disallowed_prefix.into_owned().iter() {
+                name = name.replace(prefix, "");
+            }
+        }
+
         if kind != ExportKind::Func {
             return Ok(name);
         }

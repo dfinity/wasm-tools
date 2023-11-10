@@ -485,6 +485,15 @@ pub trait Config: 'static + std::fmt::Debug {
         None
     }
 
+    /// Disallow prefix for func_names
+    /// Function names in export_func_name and export_func_name_prefix
+    /// are allowed to have these prefixes
+    ///
+    /// Defaults to 'None`
+    fn disallow_export_name_prefix(&self) -> Option<Cow<'_, [String]>> {
+        None
+    }
+
     /// Disallow importing tags
     ///
     /// Defaults to `false`
@@ -610,6 +619,7 @@ pub struct SwarmConfig {
     pub max_table_elements: u32,
     pub table_max_size_required: bool,
     pub disallow_export_names: Option<Vec<String>>,
+    pub disallow_export_name_prefix: Option<Vec<String>>,
     pub disallow_import_tags: bool,
     pub disallow_import_globals: bool,
     pub disallow_export_of_import_funcs: bool,
@@ -693,6 +703,7 @@ impl<'a> Arbitrary<'a> for SwarmConfig {
             disallow_traps: false,
             tail_call_enabled: false,
             disallow_export_names: None,
+            disallow_export_name_prefix: None,
             disallow_import_tags: false,
             disallow_import_globals: false,
             disallow_export_of_import_funcs: false,
@@ -908,6 +919,12 @@ impl Config for SwarmConfig {
 
     fn disallow_export_names(&self) -> Option<Cow<'_, [String]>> {
         self.disallow_export_names
+            .as_ref()
+            .map(|is| Cow::Borrowed(&is[..]))
+    }
+
+    fn disallow_export_name_prefix(&self) -> Option<Cow<'_, [String]>> {
+        self.disallow_export_name_prefix
             .as_ref()
             .map(|is| Cow::Borrowed(&is[..]))
     }

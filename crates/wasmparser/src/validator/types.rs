@@ -4,15 +4,16 @@ use super::{
     component::{ComponentState, ExternKind},
     core::Module,
 };
-use crate::validator::names::KebabString;
+use crate::{validator::names::KebabString, HeapType};
 use crate::{
-    BinaryReaderError, CompositeType, Export, ExternalKind, FuncType, GlobalType, Import,
-    MemoryType, PrimitiveValType, RefType, Result, SubType, TableType, TypeRef, ValType,
+    BinaryReaderError, CompositeType, Export, ExternalKind, FuncType, GlobalType, Import, Matches,
+    MemoryType, PackedIndex, PrimitiveValType, RecGroup, RefType, Result, SubType, TableType,
+    TypeRef, UnpackedIndex, ValType, WithRecGroup,
 };
 use indexmap::{IndexMap, IndexSet};
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::ops::Index;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+use std::ops::{Index, Range};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     borrow::Borrow,
@@ -503,6 +504,15 @@ impl Aliasable for AliasableResourceId {
 }
 
 impl AliasableResourceId {
+    /// Create a new instance with the specified resource ID and `self`'s alias
+    /// ID.
+    pub fn with_resource_id(&self, id: ResourceId) -> Self {
+        Self {
+            id,
+            alias_id: self.alias_id,
+        }
+    }
+
     /// Get the underlying resource.
     pub fn resource(&self) -> ResourceId {
         self.id
@@ -580,6 +590,22 @@ impl ComponentAnyTypeId {
             Self::Instance(_) => "instance",
             Self::Component(_) => "component",
         }
+    }
+}
+
+define_type_id!(
+    RecGroupId,
+    Range<CoreTypeId>,
+    rec_group_elements,
+    "recursion group"
+);
+
+impl TypeData for Range<CoreTypeId> {
+    type Id = RecGroupId;
+
+    fn type_info(&self, _types: &TypeList) -> TypeInfo {
+        let size = self.end.index() - self.start.index();
+        TypeInfo::core(u32::try_from(size).unwrap())
     }
 }
 
@@ -1433,7 +1459,7 @@ pub struct ResourceId {
     //
     // The 32-bit storage here should ideally be enough for any component
     // containing resources. If memory usage becomes an issue (this struct is
-    // 12 bytes instead of 8 or 4) then this coudl get folded into the globally
+    // 12 bytes instead of 8 or 4) then this could get folded into the globally
     // unique id with everything using an atomic increment perhaps.
     contextually_unique_id: u32,
 }
@@ -2364,7 +2390,25 @@ pub struct TypeList {
     alias_snapshots: Vec<TypeListAliasSnapshot>,
 
     // Core Wasm types.
+    //
+    // A primary map from `CoreTypeId` to `SubType`.
     core_types: SnapshotList<SubType>,
+    // The id of each core Wasm type's rec group.
+    //
+    // A secondary map from `CoreTypeId` to `RecGroupId`.
+    core_type_to_rec_group: SnapshotList<RecGroupId>,
+    // The supertype of each core type.
+    //
+    // A secondary map from `coreTypeId` to `Option<CoreTypeId>`.
+    core_type_to_supertype: SnapshotList<Option<CoreTypeId>>,
+    // A primary map from `RecGroupId` to the range of the rec group's elements
+    // within `core_types`.
+    rec_group_elements: SnapshotList<Range<CoreTypeId>>,
+    // A hash map from rec group elements to their canonical `RecGroupId`.
+    //
+    // This is `None` when a list is "committed" meaning that no more insertions
+    // can happen.
+    canonical_rec_groups: Option<HashMap<RecGroup, RecGroupId>>,
 
     // Component model types.
     components: SnapshotList<ComponentType>,
@@ -2394,6 +2438,10 @@ struct TypeListCheckpoint {
     component_funcs: usize,
     core_modules: usize,
     core_instances: usize,
+    core_type_to_rec_group: usize,
+    core_type_to_supertype: usize,
+    rec_group_elements: usize,
+    canonical_rec_groups: usize,
 }
 
 impl TypeList {
@@ -2414,6 +2462,271 @@ impl TypeList {
         id
     }
 
+    /// Intern the given recursion group (that has already been canonicalized)
+    /// and return its associated id and whether this was a new recursion group
+    /// or not.
+    pub fn intern_canonical_rec_group(&mut self, rec_group: RecGroup) -> (bool, RecGroupId) {
+        let canonical_rec_groups = self
+            .canonical_rec_groups
+            .as_mut()
+            .expect("cannot intern into a committed list");
+        let entry = match canonical_rec_groups.entry(rec_group) {
+            Entry::Occupied(e) => return (false, *e.get()),
+            Entry::Vacant(e) => e,
+        };
+
+        let rec_group_id = self.rec_group_elements.len();
+        let rec_group_id = u32::try_from(rec_group_id).unwrap();
+        let rec_group_id = RecGroupId::from_index(rec_group_id);
+
+        let start = self.core_types.len();
+        let start = u32::try_from(start).unwrap();
+        let start = CoreTypeId::from_index(start);
+
+        for ty in entry.key().types() {
+            debug_assert_eq!(self.core_types.len(), self.core_type_to_supertype.len());
+            debug_assert_eq!(self.core_types.len(), self.core_type_to_rec_group.len());
+
+            self.core_type_to_supertype
+                .push(ty.supertype_idx.map(|idx| match idx.unpack() {
+                    UnpackedIndex::RecGroup(offset) => CoreTypeId::from_index(start.index + offset),
+                    UnpackedIndex::Id(id) => id,
+                    UnpackedIndex::Module(_) => unreachable!("in canonical form"),
+                }));
+            let mut ty = ty.clone();
+            ty.remap_indices(&mut |index| {
+                match index.unpack() {
+                    UnpackedIndex::Id(_) => {}
+                    UnpackedIndex::Module(_) => unreachable!(),
+                    UnpackedIndex::RecGroup(offset) => {
+                        *index = UnpackedIndex::Id(CoreTypeId::from_index(start.index + offset))
+                            .pack()
+                            .unwrap();
+                    }
+                };
+                Ok(())
+            })
+            .expect("cannot fail");
+            self.core_types.push(ty);
+            self.core_type_to_rec_group.push(rec_group_id);
+        }
+
+        let end = self.core_types.len();
+        let end = u32::try_from(end).unwrap();
+        let end = CoreTypeId::from_index(end);
+
+        let range = start..end;
+
+        self.rec_group_elements.push(range.clone());
+
+        entry.insert(rec_group_id);
+        return (true, rec_group_id);
+    }
+
+    /// Get the `CoreTypeId` for a local index into a rec group.
+    pub fn rec_group_local_id(
+        &self,
+        rec_group: RecGroupId,
+        index: u32,
+        offset: usize,
+    ) -> Result<CoreTypeId> {
+        let elems = &self[rec_group];
+        let len = elems.end.index() - elems.start.index();
+        let len = u32::try_from(len).unwrap();
+        if index < len {
+            let id = u32::try_from(elems.start.index()).unwrap() + index;
+            let id = CoreTypeId::from_index(id);
+            Ok(id)
+        } else {
+            bail!(
+                offset,
+                "unknown type {index}: type index out of rec group bounds"
+            )
+        }
+    }
+
+    /// Get the id of the rec group that the given type id was defined within.
+    pub fn rec_group_id_of(&self, id: CoreTypeId) -> RecGroupId {
+        self.core_type_to_rec_group[id.index()]
+    }
+
+    /// Get the super type of the given type id, if any.
+    pub fn supertype_of(&self, id: CoreTypeId) -> Option<CoreTypeId> {
+        self.core_type_to_supertype[id.index()]
+    }
+
+    /// Get the `CoreTypeId` for a canonicalized `PackedIndex`.
+    ///
+    /// Panics when given a non-canonicalized `PackedIndex`.
+    pub fn at_canonicalized_packed_index(
+        &self,
+        rec_group: RecGroupId,
+        index: PackedIndex,
+        offset: usize,
+    ) -> Result<CoreTypeId> {
+        self.at_canonicalized_unpacked_index(rec_group, index.unpack(), offset)
+    }
+
+    /// Get the `CoreTypeId` for a canonicalized `UnpackedIndex`.
+    ///
+    /// Panics when given a non-canonicalized `PackedIndex`.
+    pub fn at_canonicalized_unpacked_index(
+        &self,
+        rec_group: RecGroupId,
+        index: UnpackedIndex,
+        offset: usize,
+    ) -> Result<CoreTypeId> {
+        match index {
+            UnpackedIndex::Module(_) => panic!("not canonicalized"),
+            UnpackedIndex::Id(id) => Ok(id),
+            UnpackedIndex::RecGroup(idx) => self.rec_group_local_id(rec_group, idx, offset),
+        }
+    }
+
+    /// Does `a` structurally match `b`?
+    pub fn matches(&self, a: CoreTypeId, b: CoreTypeId) -> bool {
+        let a = WithRecGroup::new(self, a);
+        let a = WithRecGroup::map(a, |a| &self[a]);
+
+        let b = WithRecGroup::new(self, b);
+        let b = WithRecGroup::map(b, |b| &self[b]);
+
+        Matches::matches(self, a, b)
+    }
+
+    /// Is `a == b` or was `a` declared (potentially transitively) to be a
+    /// subtype of `b`?
+    pub fn id_is_subtype(&self, mut a: CoreTypeId, b: CoreTypeId) -> bool {
+        loop {
+            if a == b {
+                return true;
+            }
+
+            // TODO: maintain supertype vectors and implement this check in O(1)
+            // instead of O(n) time.
+            a = match self.supertype_of(a) {
+                Some(a) => a,
+                None => return false,
+            };
+        }
+    }
+
+    /// Like `id_is_subtype` but for `RefType`s.
+    ///
+    /// Both `a` and `b` must be canonicalized already.
+    pub fn reftype_is_subtype(&self, a: RefType, b: RefType) -> bool {
+        // NB: Don't need `RecGroupId`s since we are calling from outside of the
+        // rec group, and so any `PackedIndex`es we encounter have already been
+        // canonicalized to `CoreTypeId`s directly.
+        self.reftype_is_subtype_impl(a, None, b, None)
+    }
+
+    /// Implementation of `RefType` and `HeapType` subtyping.
+    ///
+    /// Panics if we need rec groups but aren't given them. Rec groups only need
+    /// to be passed in when checking subtyping of `RefType`s that we encounter
+    /// while validating a rec group itself.
+    pub(crate) fn reftype_is_subtype_impl(
+        &self,
+        a: RefType,
+        a_group: Option<RecGroupId>,
+        b: RefType,
+        b_group: Option<RecGroupId>,
+    ) -> bool {
+        if a == b && a_group == b_group {
+            return true;
+        }
+
+        if a.is_nullable() && !b.is_nullable() {
+            return false;
+        }
+
+        let core_type_id = |group: Option<RecGroupId>, index: UnpackedIndex| -> CoreTypeId {
+            if let Some(id) = index.as_core_type_id() {
+                id
+            } else {
+                self.at_canonicalized_unpacked_index(group.unwrap(), index, usize::MAX)
+                    .expect("type references are checked during canonicalization")
+            }
+        };
+
+        let subtype = |group, index| -> &SubType {
+            let id = core_type_id(group, index);
+            &self[id]
+        };
+
+        use HeapType as HT;
+        match (a.heap_type(), b.heap_type()) {
+            (a, b) if a == b => true,
+
+            (HT::Eq | HT::I31 | HT::Struct | HT::Array | HT::None, HT::Any) => true,
+            (HT::I31 | HT::Struct | HT::Array | HT::None, HT::Eq) => true,
+            (HT::NoExtern, HT::Extern) => true,
+            (HT::NoFunc, HT::Func) => true,
+            (HT::None, HT::I31 | HT::Array | HT::Struct) => true,
+
+            (HT::Concrete(a), HT::Eq | HT::Any) => matches!(
+                subtype(a_group, a).composite_type,
+                CompositeType::Array(_) | CompositeType::Struct(_)
+            ),
+
+            (HT::Concrete(a), HT::Struct) => {
+                matches!(subtype(a_group, a).composite_type, CompositeType::Struct(_))
+            }
+
+            (HT::Concrete(a), HT::Array) => {
+                matches!(subtype(a_group, a).composite_type, CompositeType::Array(_))
+            }
+
+            (HT::Concrete(a), HT::Func) => {
+                matches!(subtype(a_group, a).composite_type, CompositeType::Func(_))
+            }
+
+            (HT::Concrete(a), HT::Concrete(b)) => {
+                self.id_is_subtype(core_type_id(a_group, a), core_type_id(b_group, b))
+            }
+
+            (HT::None, HT::Concrete(b)) => matches!(
+                subtype(b_group, b).composite_type,
+                CompositeType::Array(_) | CompositeType::Struct(_)
+            ),
+
+            (HT::NoFunc, HT::Concrete(b)) => {
+                matches!(subtype(b_group, b).composite_type, CompositeType::Func(_))
+            }
+
+            // Nothing else matches. (Avoid full wildcard matches so that
+            // adding/modifying variants is easier in the future.)
+            (HT::Concrete(_), _)
+            | (HT::Func, _)
+            | (HT::Extern, _)
+            | (HT::Any, _)
+            | (HT::None, _)
+            | (HT::NoExtern, _)
+            | (HT::NoFunc, _)
+            | (HT::Eq, _)
+            | (HT::Struct, _)
+            | (HT::Array, _)
+            | (HT::I31, _) => false,
+        }
+    }
+
+    /// Like `id_is_subtype` but for `RefType`s.
+    ///
+    /// Both `a` and `b` must be canonicalized already.
+    pub fn valtype_is_subtype(&self, a: ValType, b: ValType) -> bool {
+        match (a, b) {
+            (a, b) if a == b => true,
+            (ValType::Ref(a), ValType::Ref(b)) => self.reftype_is_subtype(a, b),
+            (ValType::Ref(_), _)
+            | (ValType::I32, _)
+            | (ValType::I64, _)
+            | (ValType::F32, _)
+            | (ValType::F64, _)
+            | (ValType::V128, _) => false,
+        }
+    }
+
     fn checkpoint(&self) -> TypeListCheckpoint {
         let TypeList {
             alias_mappings: _,
@@ -2427,6 +2740,10 @@ impl TypeList {
             component_funcs,
             core_modules,
             core_instances,
+            core_type_to_rec_group,
+            core_type_to_supertype,
+            rec_group_elements,
+            canonical_rec_groups,
         } = self;
 
         TypeListCheckpoint {
@@ -2438,6 +2755,10 @@ impl TypeList {
             component_funcs: component_funcs.len(),
             core_modules: core_modules.len(),
             core_instances: core_instances.len(),
+            core_type_to_rec_group: core_type_to_rec_group.len(),
+            core_type_to_supertype: core_type_to_supertype.len(),
+            rec_group_elements: rec_group_elements.len(),
+            canonical_rec_groups: canonical_rec_groups.as_ref().map(|m| m.len()).unwrap_or(0),
         }
     }
 
@@ -2454,6 +2775,10 @@ impl TypeList {
             component_funcs,
             core_modules,
             core_instances,
+            core_type_to_rec_group,
+            core_type_to_supertype,
+            rec_group_elements,
+            canonical_rec_groups,
         } = self;
 
         core_types.truncate(checkpoint.core_types);
@@ -2464,6 +2789,18 @@ impl TypeList {
         component_funcs.truncate(checkpoint.component_funcs);
         core_modules.truncate(checkpoint.core_modules);
         core_instances.truncate(checkpoint.core_instances);
+        core_type_to_rec_group.truncate(checkpoint.core_type_to_rec_group);
+        core_type_to_supertype.truncate(checkpoint.core_type_to_supertype);
+        rec_group_elements.truncate(checkpoint.rec_group_elements);
+
+        if let Some(canonical_rec_groups) = canonical_rec_groups {
+            assert_eq!(
+                canonical_rec_groups.len(),
+                checkpoint.canonical_rec_groups,
+                "checkpointing does not support resetting `canonical_rec_groups` (it would require a \
+                 proper immutable and persistent hash map) so adding new groups is disallowed"
+            );
+        }
     }
 
     pub fn commit(&mut self) -> TypeList {
@@ -2490,6 +2827,10 @@ impl TypeList {
             component_funcs: self.component_funcs.commit(),
             core_modules: self.core_modules.commit(),
             core_instances: self.core_instances.commit(),
+            core_type_to_rec_group: self.core_type_to_rec_group.commit(),
+            core_type_to_supertype: self.core_type_to_supertype.commit(),
+            rec_group_elements: self.rec_group_elements.commit(),
+            canonical_rec_groups: None,
         }
     }
 
@@ -2568,11 +2909,13 @@ pub(crate) struct TypeAlloc {
 impl Default for TypeAlloc {
     fn default() -> TypeAlloc {
         static NEXT_GLOBAL_ID: AtomicU64 = AtomicU64::new(0);
-        TypeAlloc {
+        let mut ret = TypeAlloc {
             list: TypeList::default(),
             globally_unique_id: NEXT_GLOBAL_ID.fetch_add(1, Ordering::Relaxed),
             next_resource_id: 0,
-        }
+        };
+        ret.list.canonical_rec_groups = Some(Default::default());
+        ret
     }
 }
 
@@ -2835,7 +3178,7 @@ impl TypeAlloc {
 ///
 /// This currently exists to abstract over `TypeAlloc` and `SubtypeArena` which
 /// both need to perform remapping operations.
-pub(crate) trait Remap
+pub trait Remap
 where
     Self: Index<ComponentTypeId, Output = ComponentType>,
     Self: Index<ComponentDefinedTypeId, Output = ComponentDefinedType>,
@@ -2848,10 +3191,12 @@ where
     where
         T: TypeData;
 
+    /// Apply `map` to the keys of `tmp`, setting `*any_changed = true` if any
+    /// keys were remapped.
     fn map_map(
         tmp: &mut IndexMap<ResourceId, Vec<usize>>,
         any_changed: &mut bool,
-        map: &mut Remapping,
+        map: &Remapping,
     ) {
         for (id, path) in mem::take(tmp) {
             let id = match map.resources.get(&id) {
@@ -2865,6 +3210,9 @@ where
         }
     }
 
+    /// If `any_changed` is true, push `ty`, update `map` to point `id` to the
+    /// new type ID, set `id` equal to the new type ID, and return `true`.
+    /// Otherwise, update `map` to point `id` to itself and return `false`.
     fn insert_if_any_changed<T>(
         &mut self,
         map: &mut Remapping,
@@ -2883,6 +3231,9 @@ where
         changed
     }
 
+    /// Recursively search for any resource types reachable from `id`, updating
+    /// it and `map` if any are found and remapped, returning `true` iff at last
+    /// one is remapped.
     fn remap_component_any_type_id(
         &mut self,
         id: &mut ComponentAnyTypeId,
@@ -2897,7 +3248,9 @@ where
         }
     }
 
-    fn remap_resource_id(&mut self, id: &mut AliasableResourceId, map: &mut Remapping) -> bool {
+    /// If `map` indicates `id` should be remapped, update it and return `true`.
+    /// Otherwise, do nothing and return `false`.
+    fn remap_resource_id(&mut self, id: &mut AliasableResourceId, map: &Remapping) -> bool {
         if let Some(changed) = map.remap_id(id) {
             return changed;
         }
@@ -2911,6 +3264,9 @@ where
         }
     }
 
+    /// Recursively search for any resource types reachable from `id`, updating
+    /// it and `map` if any are found and remapped, returning `true` iff at last
+    /// one is remapped.
     fn remap_component_type_id(&mut self, id: &mut ComponentTypeId, map: &mut Remapping) -> bool {
         if let Some(changed) = map.remap_id(id) {
             return changed;
@@ -2935,6 +3291,9 @@ where
         self.insert_if_any_changed(map, any_changed, id, ty)
     }
 
+    /// Recursively search for any resource types reachable from `id`, updating
+    /// it and `map` if any are found and remapped, returning `true` iff at last
+    /// one is remapped.
     fn remap_component_defined_type_id(
         &mut self,
         id: &mut ComponentDefinedTypeId,
@@ -2985,6 +3344,9 @@ where
         self.insert_if_any_changed(map, any_changed, id, tmp)
     }
 
+    /// Recursively search for any resource types reachable from `id`, updating
+    /// it and `map` if any are found and remapped, returning `true` iff at last
+    /// one is remapped.
     fn remap_component_instance_type_id(
         &mut self,
         id: &mut ComponentInstanceTypeId,
@@ -3009,6 +3371,9 @@ where
         self.insert_if_any_changed(map, any_changed, id, tmp)
     }
 
+    /// Recursively search for any resource types reachable from `id`, updating
+    /// it and `map` if any are found and remapped, returning `true` iff at last
+    /// one is remapped.
     fn remap_component_func_type_id(
         &mut self,
         id: &mut ComponentFuncTypeId,
@@ -3070,8 +3435,10 @@ where
     }
 }
 
+/// Utility for mapping equivalent `ResourceId`s to each other and (when paired with the `Remap` trait)
+/// non-destructively edit type lists to reflect those mappings.
 #[derive(Debug, Default)]
-pub(crate) struct Remapping {
+pub struct Remapping {
     /// A mapping from old resource ID to new resource ID.
     pub(crate) resources: HashMap<ResourceId, ResourceId>,
 
@@ -3103,6 +3470,16 @@ where
 }
 
 impl Remapping {
+    /// Add a mapping from the specified old resource ID to the new resource ID
+    pub fn add(&mut self, old: ResourceId, new: ResourceId) {
+        self.resources.insert(old, new);
+    }
+
+    /// Clear the type cache while leaving the resource mappings intact.
+    pub fn reset_type_cache(&mut self) {
+        self.types.clear()
+    }
+
     fn remap_id<T>(&self, id: &mut T) -> Option<bool>
     where
         T: Copy + Into<ComponentAnyTypeId> + TryFrom<ComponentAnyTypeId>,
@@ -3137,12 +3514,19 @@ impl Remapping {
 /// Note that this subtyping context also explicitly supports being created
 /// from to different lists `a` and `b` originally, for testing subtyping
 /// between two different components for example.
-pub(crate) struct SubtypeCx<'a> {
-    pub(crate) a: SubtypeArena<'a>,
-    pub(crate) b: SubtypeArena<'a>,
+pub struct SubtypeCx<'a> {
+    /// Lookup arena for first type argument
+    pub a: SubtypeArena<'a>,
+    /// Lookup arena for second type argument
+    pub b: SubtypeArena<'a>,
 }
 
 impl<'a> SubtypeCx<'a> {
+    /// Create a new instance with the specified type lists
+    pub fn new_with_refs(a: TypesRef<'a>, b: TypesRef<'a>) -> SubtypeCx<'a> {
+        Self::new(a.list, b.list)
+    }
+
     pub(crate) fn new(a: &'a TypeList, b: &'a TypeList) -> SubtypeCx<'a> {
         SubtypeCx {
             a: SubtypeArena::new(a),
@@ -3150,7 +3534,8 @@ impl<'a> SubtypeCx<'a> {
         }
     }
 
-    fn swap(&mut self) {
+    /// Swap the type lists
+    pub fn swap(&mut self) {
         mem::swap(&mut self.a, &mut self.b);
     }
 
@@ -3202,6 +3587,9 @@ impl<'a> SubtypeCx<'a> {
         }
     }
 
+    /// Tests whether `a` is a subtype of `b`.
+    ///
+    /// Errors are reported at the `offset` specified.
     pub fn component_type(
         &mut self,
         a: ComponentTypeId,
@@ -3284,6 +3672,9 @@ impl<'a> SubtypeCx<'a> {
         })
     }
 
+    /// Tests whether `a` is a subtype of `b`.
+    ///
+    /// Errors are reported at the `offset` specified.
     pub fn component_instance_type(
         &mut self,
         a_id: ComponentInstanceTypeId,
@@ -3317,6 +3708,9 @@ impl<'a> SubtypeCx<'a> {
         Ok(())
     }
 
+    /// Tests whether `a` is a subtype of `b`.
+    ///
+    /// Errors are reported at the `offset` specified.
     pub fn component_func_type(
         &mut self,
         a: ComponentFuncTypeId,
@@ -3389,6 +3783,9 @@ impl<'a> SubtypeCx<'a> {
         Ok(())
     }
 
+    /// Tests whether `a` is a subtype of `b`.
+    ///
+    /// Errors are reported at the `offset` specified.
     pub fn module_type(
         &mut self,
         a: ComponentCoreModuleTypeId,
@@ -3425,6 +3822,9 @@ impl<'a> SubtypeCx<'a> {
         Ok(())
     }
 
+    /// Tests whether `a` is a subtype of `b`.
+    ///
+    /// Errors are reported at the `offset` specified.
     pub fn component_any_type_id(
         &mut self,
         a: ComponentAnyTypeId,
@@ -3436,7 +3836,12 @@ impl<'a> SubtypeCx<'a> {
                 if a.resource() == b.resource() {
                     Ok(())
                 } else {
-                    bail!(offset, "resource types are not the same")
+                    bail!(
+                        offset,
+                        "resource types are not the same ({:?} vs. {:?})",
+                        a.resource(),
+                        b.resource()
+                    )
                 }
             }
             (ComponentAnyTypeId::Resource(_), b) => {
@@ -3935,7 +4340,7 @@ impl<'a> SubtypeCx<'a> {
 /// This is intended to have arena-like behavior where everything pushed onto
 /// `self.list` is thrown away after a subtyping computation is performed. All
 /// new types pushed into this arena are purely temporary.
-pub(crate) struct SubtypeArena<'a> {
+pub struct SubtypeArena<'a> {
     types: &'a TypeList,
     list: TypeList,
 }
